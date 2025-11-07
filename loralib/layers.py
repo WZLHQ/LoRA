@@ -12,7 +12,7 @@ from typing import Optional, List
 class LoRALayer():
     def __init__(
         self, 
-        r: int, 
+        r, 
         lora_alpha: int, 
         lora_dropout: float,
         merge_weights: bool,
@@ -27,63 +27,6 @@ class LoRALayer():
         # Mark the weight as unmerged
         self.merged = False
         self.merge_weights = merge_weights
-
-class Embedding(nn.Embedding, LoRALayer):
-    # LoRA implemented in a dense layer
-    def __init__(
-        self,
-        num_embeddings: int,
-        embedding_dim: int,
-        r: int = 0,
-        lora_alpha: int = 1,
-        merge_weights: bool = True,
-        **kwargs
-    ):
-        nn.Embedding.__init__(self, num_embeddings, embedding_dim, **kwargs)
-        LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=0,
-                           merge_weights=merge_weights)
-        # Actual trainable parameters
-        if r > 0:
-            self.lora_A = nn.Parameter(self.weight.new_zeros((r, num_embeddings)))
-            self.lora_B = nn.Parameter(self.weight.new_zeros((embedding_dim, r)))
-            self.scaling = self.lora_alpha / self.r
-            # Freezing the pre-trained weight matrix
-            self.weight.requires_grad = False
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        nn.Embedding.reset_parameters(self)
-        if hasattr(self, 'lora_A'):
-            # initialize A the same way as the default for nn.Linear and B to zero
-            nn.init.zeros_(self.lora_A)
-            nn.init.normal_(self.lora_B)
-
-    def train(self, mode: bool = True):
-        nn.Embedding.train(self, mode)
-        if mode:
-            if self.merge_weights and self.merged:
-                # Make sure that the weights are not merged
-                if self.r > 0:
-                    self.weight.data -= (self.lora_B @ self.lora_A).transpose(0, 1) * self.scaling
-                self.merged = False
-        else:
-            if self.merge_weights and not self.merged:
-                # Merge the weights and mark it
-                if self.r > 0:
-                    self.weight.data += (self.lora_B @ self.lora_A).transpose(0, 1) * self.scaling
-                self.merged = True
-        
-    def forward(self, x: torch.Tensor):
-        if self.r > 0 and not self.merged:
-            result = nn.Embedding.forward(self, x)
-            after_A = F.embedding(
-                x, self.lora_A.transpose(0, 1), self.padding_idx, self.max_norm,
-                self.norm_type, self.scale_grad_by_freq, self.sparse
-            )
-            result += (after_A @ self.lora_B.transpose(0, 1)) * self.scaling
-            return result
-        else:
-            return nn.Embedding.forward(self, x)
 
 class Linear(nn.Linear, LoRALayer):
     # LoRA implemented in a dense layer
@@ -147,6 +90,929 @@ class Linear(nn.Linear, LoRALayer):
             return result
         else:
             return F.linear(x, T(self.weight), bias=self.bias)
+
+class LinearForVeRA(nn.Linear, LoRALayer):
+    # VeRA implemented in a dense layer
+    def __init__(
+        self, 
+        in_features: int, 
+        out_features: int, 
+        vera_A,
+        vera_B,
+        r: int = 0, 
+        lora_alpha: int = 1, 
+        lora_dropout: float = 0.,
+        fan_in_fan_out: bool = False, # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
+        merge_weights: bool = True,
+        **kwargs
+    ):
+        nn.Linear.__init__(self, in_features, out_features, **kwargs)
+        LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+                           merge_weights=merge_weights)
+
+        self.fan_in_fan_out = fan_in_fan_out
+        self.vera_A =vera_A
+        self.vera_B =vera_B
+
+        # Actual trainable parameters
+        self.vera_lambda_b = nn.Parameter(torch.ones(out_features))
+        self.vera_lambda_d = nn.Parameter(torch.randn(r))
+
+        # Freezing the pre-trained weight matrix
+        self.weight.requires_grad = False
+        self.scaling=1
+
+        self.reset_parameters()
+
+        if fan_in_fan_out:
+            self.weight.data = self.weight.data.transpose(0, 1)
+
+    def reset_parameters(self):
+        nn.Linear.reset_parameters(self)
+        if hasattr(self, 'vera_lambda_b'):
+            with torch.no_grad():
+                nn.init.zeros_(self.vera_lambda_d).fill_(0.1)
+                nn.init.zeros_(self.vera_lambda_b)
+
+    def train(self, mode: bool = True):
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+        nn.Linear.train(self, mode)
+        if mode:
+            if self.merge_weights and self.merged:
+                # Make sure that the weights are not merged
+                if self.r > 0:
+                    sliced_A = self.vera_A[:, : self.in_features].to(self.vera_lambda_d.device)
+                    sliced_B = self.vera_B[: self.out_features, :].to(self.vera_lambda_d.device)
+                    self.weight.data -= T(torch.diag(self.vera_lambda_b)@sliced_B@ torch.diag(self.vera_lambda_d)@sliced_A) * self.scaling
+                self.merged = False
+        else:
+            if self.merge_weights and not self.merged:
+                # Merge the weights and mark it
+                if self.r > 0:
+                    sliced_A = self.vera_A[:, : self.in_features].to(self.vera_lambda_d.device)
+                    sliced_B = self.vera_B[: self.out_features, :].to(self.vera_lambda_d.device)
+                    self.weight.data += T(torch.diag(self.vera_lambda_b)@sliced_B@ torch.diag(self.vera_lambda_d)@sliced_A) * self.scaling
+                self.merged = True       
+
+    def forward(self, x: torch.Tensor):
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+        if self.r > 0 and not self.merged:
+            result = F.linear(x, T(self.weight), bias=self.bias)
+            sliced_A = self.vera_A[:, : self.in_features].to(x.device)
+            sliced_B = self.vera_B[: self.out_features, :].to(x.device)
+            result += self.lora_dropout(x)@sliced_A.transpose(0, 1)*self.vera_lambda_d @ sliced_B.transpose(0, 1)*self.vera_lambda_b*self.scaling
+            return result
+        else:
+            return F.linear(x, T(self.weight), bias=self.bias)
+
+class LinearForDictLoRA(nn.Linear, LoRALayer):
+    # DictLoRA implemented in a dense layer
+    def __init__(
+        self, 
+        in_features: int, 
+        out_features: int, 
+        key: str, # should be a str
+        r: int = 0, 
+        lora_alpha: int = 1, 
+        lora_dropout: float = 0.,
+        fan_in_fan_out: bool = False, # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
+        merge_weights: bool = True,
+        **kwargs
+    ):
+        nn.Linear.__init__(self, in_features, out_features, **kwargs)
+        LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+                           merge_weights=merge_weights)
+
+        self.fan_in_fan_out = fan_in_fan_out
+        self.key = key
+
+        # Actual trainable parameters
+        if r > 0:
+            self.lora_A = nn.ParameterDict()
+            self.lora_B = nn.ParameterDict()
+            self.lora_A[key]=nn.Parameter(self.weight.new_zeros((r, in_features)))
+            self.lora_B[key]=nn.Parameter(self.weight.new_zeros((out_features, r)))
+            self.scaling = 1.0
+            # Freezing the pre-trained weight matrix
+            self.weight.requires_grad = False
+        self.reset_parameters()
+        if fan_in_fan_out:
+            self.weight.data = self.weight.data.transpose(0, 1)
+
+    def reset_parameters(self):
+        nn.Linear.reset_parameters(self)
+        if hasattr(self, 'lora_A'):
+            # initialize A the same way as the default for nn.Linear and B to zero
+            for v in self.lora_A.values():
+                nn.init.kaiming_uniform_(v, a=math.sqrt(5))
+            for v in self.lora_B.values():
+                nn.init.zeros_(v)
+
+    def train(self, mode: bool = True):
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+        nn.Linear.train(self, mode)
+        if mode:
+            if self.merge_weights and self.merged:
+                # Make sure that the weights are not merged
+                if self.r > 0:
+                    self.weight.data -= T(self.lora_B[self.key] @ self.lora_A[self.key]) * self.scaling
+                self.merged = False
+        else:
+            if self.merge_weights and not self.merged:
+                # Merge the weights and mark it
+                if self.r > 0:
+                    self.weight.data += T(self.lora_B[self.key] @ self.lora_A[self.key]) * self.scaling
+                self.merged = True       
+
+    def forward(self, x: torch.Tensor):
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+        if self.r > 0 and not self.merged:
+            result = F.linear(x, T(self.weight), bias=self.bias)            
+            result += (self.lora_dropout(x) @ self.lora_A[self.key].transpose(0, 1) @ self.lora_B[self.key].transpose(0, 1)) * self.scaling
+            return result
+        else:
+            return F.linear(x, T(self.weight), bias=self.bias)
+
+class LinearForDictLoRA4LanFusion(nn.Linear, LoRALayer):
+    # DictLoRA4LanFusion implemented in a dense layer
+    def __init__(
+        self, 
+        in_features: int, 
+        out_features: int, 
+        key_list: list, # should be a list
+        r: list, 
+        lora_alpha: int = 1, 
+        lora_dropout: float = 0.,
+        fan_in_fan_out: bool = False, # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
+        merge_weights: bool = True,
+        **kwargs
+    ):
+        nn.Linear.__init__(self, in_features, out_features, **kwargs)
+        LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+                           merge_weights=merge_weights)
+
+        self.fan_in_fan_out = fan_in_fan_out
+        self.key_list = key_list
+
+        # Actual trainable parameters
+        if r[0] > 0:
+            self.lora_A = nn.ParameterDict()
+            self.lora_B = nn.ParameterDict()
+            for id,k in enumerate(key_list):
+                self.lora_A[k]=nn.Parameter(self.weight.new_zeros((r[id], in_features)))
+                self.lora_B[k]=nn.Parameter(self.weight.new_zeros((out_features, r[id])))
+                
+            self.scaling=1/len(key_list)
+            # Freezing the pre-trained weight matrix
+            self.weight.requires_grad = False
+
+        self.reset_parameters()
+        if fan_in_fan_out:
+            self.weight.data = self.weight.data.transpose(0, 1)
+
+    def reset_parameters(self):
+        nn.Linear.reset_parameters(self)
+        if hasattr(self, 'lora_A'):
+            # initialize A the same way as the default for nn.Linear and B to zero
+            for v in self.lora_A.values():
+                nn.init.kaiming_uniform_(v, a=math.sqrt(5))
+            for v in self.lora_B.values():
+                nn.init.zeros_(v)
+
+    def train(self, mode: bool = True):
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+        nn.Linear.train(self, mode)
+        if mode:
+            if self.merge_weights and self.merged:
+                # Make sure that the weights are not merged
+                if self.r[0] > 0:
+                    self.weight.data -= self.scaling * T(torch.cat([ self.lora_B[k] for k in self.key_list],dim=-1) @ torch.cat([ self.lora_A[k] for k in self.key_list],dim=0))
+                self.merged = False
+        else:
+            if self.merge_weights and not self.merged:
+                # Merge the weights and mark it
+                if self.r[0] > 0:
+                    self.weight.data += self.scaling * T(torch.cat([ self.lora_B[k] for k in self.key_list],dim=-1) @ torch.cat([ self.lora_A[k] for k in self.key_list],dim=0))
+                self.merged = True
+
+    def forward(self, x: torch.Tensor):
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+        if self.r[0] > 0 and not self.merged:
+            result = F.linear(x, T(self.weight), bias=self.bias)
+            result += self.scaling * self.lora_dropout(x) @ torch.cat([ self.lora_A[k].transpose(0, 1) for k in self.key_list],dim=-1) @ torch.cat([ self.lora_B[k].transpose(0, 1) for k in self.key_list],dim=0)
+            return result
+        else:
+            return F.linear(x, T(self.weight), bias=self.bias)
+
+class LinearForDictLoRA4VeLoRA(nn.Linear, LoRALayer):
+    # DictLoRA4veLoRA implemented in a dense layer
+    def __init__(
+        self, 
+        in_features: int, 
+        out_features: int, 
+        key_list: list, # should be a list
+        r: List, # each value should be paired with key_list
+        initial_type="ones", # for lora_A/B_kid, not for lora_A_kid_scaling
+        lora_alpha: int = 1,
+        lora_dropout: float = 0.,
+        fan_in_fan_out: bool = False,
+        merge_weights: bool = True,
+        temperature=6.0, # this is empirical value, since we don't want the scaling weights to be sharper
+        **kwargs
+    ):
+        nn.Linear.__init__(self, in_features, out_features, **kwargs)
+        LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+                           merge_weights=merge_weights)
+
+        self.fan_in_fan_out = fan_in_fan_out
+        self.key_list = key_list
+        r_father=sum(r)
+        self.r_father=r_father
+        self.initial_type=initial_type
+        self.temperature=temperature
+        
+        if r_father > 0:
+            self.lora_A = nn.ParameterDict()
+            self.lora_B = nn.ParameterDict()
+            for id, k in enumerate(key_list):
+                self.lora_A[k]=nn.Parameter(self.weight.new_zeros((r[id], in_features)))
+                self.lora_B[k]=nn.Parameter(self.weight.new_zeros((out_features, r[id])))
+            
+            # Actual trainable parameters
+            self.lora_A_kid=nn.Parameter(self.weight.new_ones((r_father)))
+            self.lora_B_kid=nn.Parameter(self.weight.new_ones((out_features)))
+            # we do not use other initialization methods for lora_A_kid_scaling
+            self.lora_A_kid_scaling=nn.Parameter(self.weight.new_ones((len(key_list))))
+
+            # Freezing the pre-trained weight matrix
+            self.weight.requires_grad = False
+
+        self.reset_parameters()
+        if fan_in_fan_out:
+            self.weight.data = self.weight.data.transpose(0, 1)
+
+    def reset_parameters(self):
+        nn.Linear.reset_parameters(self)
+        if hasattr(self, 'lora_A_kid'):
+            if self.initial_type == "ones":
+                pass
+            elif self.initial_type == "vera":
+                self.lora_A_kid.data.fill_(0.1)
+                nn.init.zeros_(self.lora_B_kid)
+            elif self.initial_type=="kaiming":
+                nn.init.kaiming_uniform(self.lora_A_kid[:,None],a=math.sqrt(5))
+                nn.init.kaiming_uniform(self.lora_B_kid[:,None],a=math.sqrt(5))
+                self.lora_A_kid.unsqueeze(-1)
+                self.lora_B_kid.unsqueeze(-1)
+            else:
+                raise NotImplementedError
+
+    def get_loraA_integration(self):
+        return torch.cat([ self.lora_A[k].transpose(0, 1)*self.get_softmax_scaling()[id] for id,k in enumerate(self.key_list) ], dim=-1)
+
+    def get_loraB_integration(self):
+        return torch.cat([ self.lora_B[k].transpose(0, 1) for k in self.key_list ],dim=0)
+
+    def get_softmax_scaling(self):
+        return torch.nn.functional.softmax(self.lora_A_kid_scaling/self.temperature, dim=0)
+    
+    def get_A_kid(self):
+        return self.lora_A_kid
+    
+    def get_B_kid(self):
+        return self.lora_B_kid
+    
+    def train(self, mode: bool = True):
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+        nn.Linear.train(self, mode)
+        if mode:
+            if self.merge_weights and self.merged:
+                # Make sure that the weights are not merged
+                if self.r_father > 0:
+                    # original VeLoRA
+                    self.weight.data -= T( torch.diag(self.get_B_kid()) @ self.get_loraB_integration().T @ torch.diag(self.get_A_kid()) @ self.get_loraA_integration().T )
+                    # remove A vector
+                    # self.weight.data -= T( torch.diag(self.get_B_kid()) @ self.get_loraB_integration().T @ self.get_loraA_integration().T )
+                    # remove B vector
+                    # self.weight.data -= T( self.get_loraB_integration().T @ torch.diag(self.get_A_kid()) @ self.get_loraA_integration().T )
+                self.merged = False
+        else:
+            if self.merge_weights and not self.merged:
+                # Merge the weights and mark it
+                if self.r_father > 0:
+                    # original VeLoRA
+                    self.weight.data += T( torch.diag(self.get_B_kid()) @ self.get_loraB_integration().T @ torch.diag(self.get_A_kid()) @ self.get_loraA_integration().T )
+                    # remove A vector
+                    # self.weight.data += T( torch.diag(self.get_B_kid()) @ self.get_loraB_integration().T @ self.get_loraA_integration().T )
+                    # remove B vector
+                    # self.weight.data += T( self.get_loraB_integration().T @ torch.diag(self.get_A_kid()) @ self.get_loraA_integration().T )
+                self.merged = True
+
+    def forward(self, x: torch.Tensor):
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+        if self.r_father > 0 and not self.merged:
+            result = F.linear(x, T(self.weight), bias=self.bias)
+            # original VeLoRA
+            result += self.lora_dropout(x) @ self.get_loraA_integration() * self.get_A_kid() @ self.get_loraB_integration() * self.get_B_kid()
+            # remove A vector
+            # result += self.lora_dropout(x) @ self.get_loraA_integration() @ self.get_loraB_integration() * self.get_B_kid()
+            # remove B vector
+            # result += self.lora_dropout(x) @ self.get_loraA_integration() * self.get_A_kid() @ self.get_loraB_integration()
+            return result
+        else:
+            return F.linear(x, T(self.weight), bias=self.bias)
+
+class LinearForDictLoRA4VeLoRA_Add_lora_A_kid_(nn.Linear, LoRALayer):
+    # DictLoRA4veLoRA implemented in a dense layer
+    def __init__(
+        self, 
+        in_features: int, 
+        out_features: int, 
+        key_list: list, # should be a list
+        r: List, # each value should be paired with key_list
+        initial_type="ones", # for lora_A/B_kid, not for lora_A_kid_scaling
+        lora_alpha: int = 1,
+        lora_dropout: float = 0.,
+        fan_in_fan_out: bool = False,
+        merge_weights: bool = True,
+        temperature=6.0, # this is empirical value, since we don't want the scaling weights to be sharper
+        **kwargs
+    ):
+        nn.Linear.__init__(self, in_features, out_features, **kwargs)
+        LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+                           merge_weights=merge_weights)
+
+        self.fan_in_fan_out = fan_in_fan_out
+        self.key_list = key_list
+        r_father=sum(r)
+        self.r_father=r_father
+        self.initial_type=initial_type
+        self.temperature=temperature
+        
+        if r_father > 0:
+            self.lora_A = nn.ParameterDict()
+            self.lora_B = nn.ParameterDict()
+            for id, k in enumerate(key_list):
+                self.lora_A[k]=nn.Parameter(self.weight.new_zeros((r[id], in_features)))
+                self.lora_B[k]=nn.Parameter(self.weight.new_zeros((out_features, r[id])))
+            
+            # Actual trainable parameters
+            self.lora_A_kid=nn.Parameter(self.weight.new_ones((r_father)))
+            self.lora_A_kid_=nn.Parameter(self.weight.new_ones((in_features)))
+            self.lora_B_kid=nn.Parameter(self.weight.new_ones((out_features)))
+            # we do not use other initialization methods for lora_A_kid_scaling
+            self.lora_A_kid_scaling=nn.Parameter(self.weight.new_ones((len(key_list))))
+
+            # Freezing the pre-trained weight matrix
+            self.weight.requires_grad = False
+
+        self.reset_parameters()
+        if fan_in_fan_out:
+            self.weight.data = self.weight.data.transpose(0, 1)
+
+    def reset_parameters(self):
+        nn.Linear.reset_parameters(self)
+        if hasattr(self, 'lora_A_kid'):
+            if self.initial_type == "ones":
+                pass
+            elif self.initial_type == "vera":
+                self.lora_A_kid.data.fill_(0.1)
+                nn.init.zeros_(self.lora_B_kid)
+            elif self.initial_type=="kaiming":
+                nn.init.kaiming_uniform(self.lora_A_kid[:,None],a=math.sqrt(5))
+                nn.init.kaiming_uniform(self.lora_B_kid[:,None],a=math.sqrt(5))
+                self.lora_A_kid.unsqueeze(-1)
+                self.lora_B_kid.unsqueeze(-1)
+            else:
+                raise NotImplementedError
+
+    def get_loraA_integration(self):
+        return torch.cat([ self.lora_A[k].transpose(0, 1)*self.get_softmax_scaling()[id] for id,k in enumerate(self.key_list) ], dim=-1)
+
+    def get_loraB_integration(self):
+        return torch.cat([ self.lora_B[k].transpose(0, 1) for k in self.key_list ],dim=0)
+
+    def get_softmax_scaling(self):
+        return torch.nn.functional.softmax(self.lora_A_kid_scaling/self.temperature, dim=0)
+
+    def get_A_kid(self):
+        return self.lora_A_kid
+
+    def get_A_kid_(self):
+        return self.lora_A_kid_
+
+    def get_B_kid(self):
+        return self.lora_B_kid
+    
+    def train(self, mode: bool = True):
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+        nn.Linear.train(self, mode)
+        if mode:
+            if self.merge_weights and self.merged:
+                # Make sure that the weights are not merged
+                if self.r_father > 0:
+                    self.weight.data -= T( torch.diag(self.get_B_kid()) @ self.get_loraB_integration().T @ torch.diag(self.get_A_kid()) @ self.get_loraA_integration().T @ torch.diag(self.get_A_kid_()) )
+                self.merged = False
+        else:
+            if self.merge_weights and not self.merged:
+                # Merge the weights and mark it
+                if self.r_father > 0:
+                    self.weight.data += T( torch.diag(self.get_B_kid()) @ self.get_loraB_integration().T @ torch.diag(self.get_A_kid()) @ self.get_loraA_integration().T @ torch.diag(self.get_A_kid_()) )
+                self.merged = True
+
+    def forward(self, x: torch.Tensor):
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+        if self.r_father > 0 and not self.merged:
+            result = F.linear(x, T(self.weight), bias=self.bias)
+            result += self.lora_dropout(x) * self.get_A_kid_() @ self.get_loraA_integration() * self.get_A_kid() @ self.get_loraB_integration() * self.get_B_kid()
+            return result
+        else:
+            return F.linear(x, T(self.weight), bias=self.bias)
+
+class LinearForDictLoRA4FasterVeLoRA(nn.Linear, LoRALayer):
+    # DictLoRA4FasterVeLoRA (merge lora experts) implemented in a dense layer
+    def __init__(
+        self, 
+        in_features: int, 
+        out_features: int, 
+        key_list: list, # should be a list
+        r: List, # each value should be paired with key_list
+        initial_type="ones", # for lora_A/B_kid, not for lora_A_kid_scaling
+        lora_alpha: int = 1,
+        lora_dropout: float = 0.,
+        fan_in_fan_out: bool = False,
+        merge_weights: bool = True,
+        temperature=6.0, # this is empirical value, since we don't want the scaling weights to be sharper
+        **kwargs
+    ):
+        nn.Linear.__init__(self, in_features, out_features, **kwargs)
+        LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+                           merge_weights=merge_weights)
+
+        self.fan_in_fan_out = fan_in_fan_out
+        self.key_list = key_list
+        r_father=sum(r)
+        self.r_father=r_father
+        self.initial_type=initial_type
+        self.temperature=temperature
+        
+        if r_father > 0:
+            self.lora_A = nn.ParameterDict()
+            self.lora_B = nn.ParameterDict()
+            for id, k in enumerate(key_list):
+                self.lora_A[k]=nn.Parameter(self.weight.new_zeros((r[id], in_features)))
+                self.lora_B[k]=nn.Parameter(self.weight.new_zeros((out_features, r[id])))
+            
+            # Actual trainable parameters
+            self.lora_B_kid=nn.Parameter(self.weight.new_ones((out_features)))
+            # self.lora_A_kid=nn.Parameter(self.weight.new_ones((in_features)))
+
+            self.lora_scaling=[1/len(key_list)]*len(key_list)
+
+            # Freezing the pre-trained weight matrix
+            self.weight.requires_grad = False
+
+        self.reset_parameters()
+        if fan_in_fan_out:
+            self.weight.data = self.weight.data.transpose(0, 1)
+
+    def reset_parameters(self):
+        nn.Linear.reset_parameters(self)
+        if hasattr(self, 'lora_B_kid'):
+            if self.initial_type == "ones":
+                pass
+
+            else:
+                raise NotImplementedError
+
+    def get_loraA_integration(self):
+        return torch.cat([ self.lora_A[k].transpose(0, 1)*self.lora_scaling[id] for id,k in enumerate(self.key_list) ], dim=-1)
+
+    def get_loraB_integration(self):
+        return torch.cat([ self.lora_B[k].transpose(0, 1) for k in self.key_list ],dim=0)
+
+    def get_A_kid(self):
+        return 1.0
+        # return self.lora_A_kid
+    
+    def get_B_kid(self):
+        return self.lora_B_kid
+
+    def train(self, mode: bool = True):
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+        nn.Linear.train(self, mode)
+
+        # merge the lora experts
+        self.weight.data += T( self.get_loraB_integration().T @ self.get_loraA_integration().T )
+
+    def forward(self, x: torch.Tensor):
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+        
+        return F.linear(x* self.get_A_kid(), T(self.weight), bias=self.bias) * self.get_B_kid()
+
+
+class LinearForDictLoRA4CAT(nn.Linear, LoRALayer):
+    # DictLoRA4CAT implemented in a dense layer (Lora soups: Merging loras for practical skill composition tasks, https://arxiv.org/pdf/2410.13025?)
+    def __init__(
+        self, 
+        in_features: int, 
+        out_features: int, 
+        key_list: list, # should be a list
+        r: List, # each value should be paired with key_list
+        initial_type="ones", # for lora_A/B_kid, not for lora_A_kid_scaling
+        lora_alpha: int = 1,
+        lora_dropout: float = 0.,
+        fan_in_fan_out: bool = False,
+        merge_weights: bool = True,
+        temperature=6.0, # this is empirical value, since we don't want the scaling weights to be sharper
+        **kwargs
+    ):
+        nn.Linear.__init__(self, in_features, out_features, **kwargs)
+        LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+                           merge_weights=merge_weights)
+
+        self.fan_in_fan_out = fan_in_fan_out
+        self.key_list = key_list
+        r_father=sum(r)
+        self.r_father=r_father
+        self.initial_type=initial_type
+        self.temperature=temperature
+        
+        if r_father > 0:
+            self.lora_A = nn.ParameterDict()
+            self.lora_B = nn.ParameterDict()
+            for id, k in enumerate(key_list):
+                self.lora_A[k]=nn.Parameter(self.weight.new_zeros((r[id], in_features)))
+                self.lora_B[k]=nn.Parameter(self.weight.new_zeros((out_features, r[id])))
+            
+            # we do not use other initialization methods for lora_A_kid_scaling
+            self.lora_A_kid_scaling=nn.Parameter(self.weight.new_ones((len(key_list))))
+
+            # Freezing the pre-trained weight matrix
+            self.weight.requires_grad = False
+
+        self.reset_parameters()
+        if fan_in_fan_out:
+            self.weight.data = self.weight.data.transpose(0, 1)
+
+    def reset_parameters(self):
+        nn.Linear.reset_parameters(self)
+
+    def get_loraA_integration(self):
+        return torch.cat([ self.lora_A[k].transpose(0, 1)*self.get_softmax_scaling()[id] for id,k in enumerate(self.key_list) ], dim=-1)
+
+    def get_loraB_integration(self):
+        return torch.cat([ self.lora_B[k].transpose(0, 1) for k in self.key_list ],dim=0)
+
+    def get_softmax_scaling(self):
+        return torch.nn.functional.softmax(self.lora_A_kid_scaling/self.temperature, dim=0)
+    
+    def train(self, mode: bool = True):
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+        nn.Linear.train(self, mode)
+        if mode:
+            if self.merge_weights and self.merged:
+                # Make sure that the weights are not merged
+                if self.r_father > 0:
+                    self.weight.data -= T( self.get_loraB_integration().T @ self.get_loraA_integration().T )
+                self.merged = False
+        else:
+            if self.merge_weights and not self.merged:
+                # Merge the weights and mark it
+                if self.r_father > 0:
+                    self.weight.data += T( self.get_loraB_integration().T @ self.get_loraA_integration().T )
+                self.merged = True
+
+    def forward(self, x: torch.Tensor):
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+        if self.r_father > 0 and not self.merged:
+            result = F.linear(x, T(self.weight), bias=self.bias)            
+            result += self.lora_dropout(x) @ self.get_loraA_integration() @ self.get_loraB_integration()
+            return result
+        else:
+            return F.linear(x, T(self.weight), bias=self.bias)
+
+class LinearForDictLoRA4ECAM(nn.Linear, LoRALayer):
+    # DictLoRA4ECAM implemented in a dense layer
+    def __init__(
+        self, 
+        in_features: int, 
+        out_features: int, 
+        key: str,
+        r: int,
+        lora_alpha: int = 1,
+        lora_dropout: float = 0.,
+        fan_in_fan_out: bool = False,
+        merge_weights: bool = True,
+        **kwargs
+    ):
+        nn.Linear.__init__(self, in_features, out_features, **kwargs)
+        LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+                           merge_weights=merge_weights)
+        
+        self.fan_in_fan_out = fan_in_fan_out
+        self.key = key
+        
+        # Actual trainable parameters
+        if r > 0:
+            self.lora_A = nn.ParameterDict()
+            self.lora_B = nn.ParameterDict()
+            self.lora_A[key]=nn.Parameter(self.weight.new_zeros((r, in_features)))
+            self.lora_B[key]=nn.Parameter(self.weight.new_zeros((out_features, r)))
+            self.scaling = 1.0
+            # Freezing the pre-trained weight matrix
+            self.weight.requires_grad = False
+        self.reset_parameters()
+        if fan_in_fan_out:
+            self.weight.data = self.weight.data.transpose(0, 1)
+
+    def reset_parameters(self):
+        nn.Linear.reset_parameters(self)
+        if hasattr(self, 'lora_A'):
+            # initialize A the same way as the default for nn.Linear and B to zero
+            for v in self.lora_A.values():
+                nn.init.kaiming_uniform_(v, a=math.sqrt(5))
+            for v in self.lora_B.values():
+                nn.init.zeros_(v)
+
+    def train(self, mode: bool = True):
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+        nn.Linear.train(self, mode)
+        if mode:
+            if self.merge_weights and self.merged:
+                # Make sure that the weights are not merged
+                if self.r > 0:
+                    self.weight.data -= T(self.lora_B[self.key] @ self.lora_A[self.key]) * self.scaling
+                self.merged = False
+        else:
+            if self.merge_weights and not self.merged:
+                # Merge the weights and mark it
+                if self.r > 0:
+                    self.weight.data += T(self.lora_B[self.key] @ self.lora_A[self.key]) * self.scaling
+                self.merged = True       
+
+    def forward(self, x: torch.Tensor):
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+        if self.r > 0 and not self.merged:
+            result = F.linear(x, T(self.weight), bias=self.bias)            
+            result += (self.lora_dropout(x) @ self.lora_A[self.key].transpose(0, 1) @ self.lora_B[self.key].transpose(0, 1)) * self.scaling
+            return result
+        else:
+            return F.linear(x, T(self.weight), bias=self.bias)
+
+class LinearForDictLoRA4PCAM(nn.Linear, LoRALayer):
+    # DictLoRA4PCAM implemented in a dense layer
+    def __init__(
+        self, 
+        in_features: int, 
+        out_features: int, 
+        key_list: list, # should be a list
+        r: list, 
+        domain: str,
+        lora_alpha: int = 1, 
+        lora_dropout: float = 0.,
+        fan_in_fan_out: bool = False, # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
+        merge_weights: bool = True,
+        **kwargs
+    ):
+        nn.Linear.__init__(self, in_features, out_features, **kwargs)
+        LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+                           merge_weights=merge_weights)
+
+        self.fan_in_fan_out = fan_in_fan_out
+        self.key_list = key_list
+        self.domain = domain
+
+        # Actual trainable parameters
+        if r[0] > 0:
+            self.lora_A = nn.ParameterDict()
+            self.lora_B = nn.ParameterDict()
+            for id,k in enumerate(key_list):
+                self.lora_A[k]=nn.Parameter(self.weight.new_zeros((r[id], in_features)))
+                self.lora_B[k]=nn.Parameter(self.weight.new_zeros((out_features, r[id])))
+                
+            # Freezing the pre-trained weight matrix
+            self.weight.requires_grad = False
+
+        self.reset_parameters()
+        if fan_in_fan_out:
+            self.weight.data = self.weight.data.transpose(0, 1)
+
+    def reset_parameters(self):
+        nn.Linear.reset_parameters(self)
+        if hasattr(self, 'lora_A'):
+            # initialize A the same way as the default for nn.Linear and B to zero
+            for v in self.lora_A.values():
+                nn.init.kaiming_uniform_(v, a=math.sqrt(5))
+            for v in self.lora_B.values():
+                nn.init.zeros_(v)
+
+    def train(self, mode: bool = True):
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+        nn.Linear.train(self, mode)
+
+    def similarity_fusion(self,x):
+
+        # teacher (batch, time, d_k)
+        students=[]
+        for k, loraA in self.lora_A.items():
+            if k==self.domain:
+                teacher=( x @ loraA.transpose(0, 1) @ self.lora_B[k].transpose(0, 1) ).detach()
+            else:
+                students.append( x @ loraA.transpose(0, 1) @ self.lora_B[k].transpose(0, 1) )
+
+        # frame-level similarity fusion, students shape --> (batch, time, n_sourch_adapters, d_k)
+        students=torch.stack(students,dim=-2)
+        scores = torch.matmul(teacher.unsqueeze(2), students.transpose(-2, -1)) / math.sqrt(teacher.size(-1))
+
+        # scores and att_map: (batch, time, n_adapters)
+        scores = torch.squeeze(scores, dim=2)
+        att_map = torch.softmax(scores, dim=-1)
+
+        # fusion different students
+        x = torch.matmul(att_map.unsqueeze(2), students)
+        x = torch.squeeze(x, dim=2)
+        return x
+
+    def forward(self, x: torch.Tensor):
+
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+        
+        result = F.linear(x, T(self.weight), bias=self.bias)
+        result+=self.similarity_fusion(self.lora_dropout(x))
+        return result
+
+class LinearForDictLoRA4MOLE(nn.Linear, LoRALayer):
+    # denotes MoeLoRA in our paper
+    def __init__(
+        self, 
+        in_features: int, 
+        out_features: int, 
+        key_list: list, # should be a list
+        r: List, # each value should be paired with key_list
+        initial_type="ones", # for lora_A/B_kid, not for lora_A_kid_scaling
+        lora_alpha: int = 1,
+        lora_dropout: float = 0.,
+        fan_in_fan_out: bool = False,
+        merge_weights: bool = True,
+        temperature=6.0, # this is empirical value, since we don't want the scaling weights to be sharper
+        **kwargs
+    ):
+        nn.Linear.__init__(self, in_features, out_features, **kwargs)
+        LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+                           merge_weights=merge_weights)
+
+        self.fan_in_fan_out = fan_in_fan_out
+        self.key_list = key_list
+        r_father=sum(r)
+        self.r_father=r_father
+        self.initial_type=initial_type
+        self.temperature=temperature
+        
+        if r_father > 0:
+            self.lora_A = nn.ParameterDict()
+            self.lora_B = nn.ParameterDict()
+            for id, k in enumerate(key_list):
+                self.lora_A[k]=nn.Parameter(self.weight.new_zeros((r[id], in_features)))
+                self.lora_B[k]=nn.Parameter(self.weight.new_zeros((out_features, r[id])))
+            
+            self.lora_router=nn.Linear(in_features, len(key_list), bias=False)
+
+            # Freezing the pre-trained weight matrix
+            self.weight.requires_grad = False
+
+        self.reset_parameters()
+        if fan_in_fan_out:
+            self.weight.data = self.weight.data.transpose(0, 1)
+
+    def reset_parameters(self):
+        nn.Linear.reset_parameters(self)
+
+    def get_loraA_integration(self, fusion_weights):
+        fusion_A=fusion_weights * torch.stack([ self.lora_A[k].transpose(0, 1) for k in self.key_list ], dim=-1)
+        return torch.sum(fusion_A,dim=-1)
+
+    def get_loraB_integration(self, fusion_weights):
+        fusion_B=fusion_weights * torch.stack([ self.lora_B[k].transpose(0, 1) for k in self.key_list ], dim=-1)
+        return torch.sum(fusion_B,dim=-1)
+    
+    def train(self, mode: bool = True):
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+        nn.Linear.train(self, mode)
+
+    def forward(self, x: torch.Tensor):
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+        result = F.linear(x, T(self.weight), bias=self.bias)
+        fusion_weights=nn.functional.softmax(self.lora_router(   torch.mean(torch.mean(x,0),0)/self.temperature   ),dim=-1)
+        result += self.lora_dropout(x) @ self.get_loraA_integration(fusion_weights) @ self.get_loraB_integration(fusion_weights)
+        return result
+
+class LinearForDictLoRA4SAMD(nn.Linear, LoRALayer):
+    # denotes MoeLoRA* in our paper
+    def __init__(
+        self, 
+        in_features: int, 
+        out_features: int, 
+        key_list: list, # should be a list
+        r: List, # each value should be paired with key_list
+        initial_type="ones", # for lora_A/B_kid, not for lora_A_kid_scaling
+        lora_alpha: int = 1,
+        lora_dropout: float = 0.,
+        fan_in_fan_out: bool = False,
+        merge_weights: bool = True,
+        temperature=6.0, # this is empirical value, since we don't want the scaling weights to be sharper
+        **kwargs
+    ):
+        nn.Linear.__init__(self, in_features, out_features, **kwargs)
+        LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+                           merge_weights=merge_weights)
+
+        self.fan_in_fan_out = fan_in_fan_out
+        self.key_list = key_list
+        r_father=sum(r)
+        self.r_father=r_father
+        self.initial_type=initial_type
+        self.temperature=temperature
+        
+        if r_father > 0:
+            self.lora_A = nn.ParameterDict()
+            self.lora_B = nn.ParameterDict()
+            for id, k in enumerate(key_list):
+                self.lora_A[k]=nn.Parameter(self.weight.new_zeros((r[id], in_features)))
+                self.lora_B[k]=nn.Parameter(self.weight.new_zeros((out_features, r[id])))
+            
+            self.lora_router=nn.Linear(in_features, len(key_list), bias=False)
+
+            # Freezing the pre-trained weight matrix
+            self.weight.requires_grad = False
+
+        self.reset_parameters()
+        if fan_in_fan_out:
+            self.weight.data = self.weight.data.transpose(0, 1)
+
+    def reset_parameters(self):
+        nn.Linear.reset_parameters(self)
+
+    def get_loraA_integration(self, fusion_weights):
+        fusion_A=fusion_weights * torch.stack([ self.lora_A[k].transpose(0, 1) for k in self.key_list ], dim=-1)
+        return torch.sum(fusion_A,dim=-1)
+
+    def get_loraB_integration(self, fusion_weights):
+        fusion_B=fusion_weights * torch.stack([ self.lora_B[k].transpose(0, 1) for k in self.key_list ], dim=-1)
+        return torch.sum(fusion_B,dim=-1)
+    
+    def train(self, mode: bool = True):
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+        nn.Linear.train(self, mode)
+
+    def forward(self, x: torch.Tensor):
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+        result = F.linear(x, T(self.weight), bias=self.bias)
+        fusion_weights=nn.functional.softmax(self.lora_router(   torch.mean(torch.mean(x,0),0)/self.temperature   ),dim=-1)
+        result += self.lora_dropout(x) @ self.get_loraA_integration(fusion_weights) @ self.get_loraB_integration(fusion_weights)
+        return result
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 class LinearForLoRACombineAdapterH(nn.Linear, LoRALayer):
     # LoRACombineAdapterH implemented in a dense layer
@@ -523,67 +1389,3 @@ class MergedLinear(nn.Linear, LoRALayer):
                 result += self.lora_dropout(x) @ T(self.merge_AB().T) * self.scaling
             return result
 
-class ConvLoRA(nn.Module, LoRALayer):
-    def __init__(self, conv_module, in_channels, out_channels, kernel_size, r=0, lora_alpha=1, lora_dropout=0., merge_weights=True, **kwargs):
-        super(ConvLoRA, self).__init__()
-        self.conv = conv_module(in_channels, out_channels, kernel_size, **kwargs)
-        LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, merge_weights=merge_weights)
-        assert isinstance(kernel_size, int)
-        # Actual trainable parameters
-        if r > 0:
-            self.lora_A = nn.Parameter(
-                self.conv.weight.new_zeros((r * kernel_size, in_channels * kernel_size))
-            )
-            self.lora_B = nn.Parameter(
-              self.conv.weight.new_zeros((out_channels//self.conv.groups*kernel_size, r*kernel_size))
-            )
-            self.scaling = self.lora_alpha / self.r
-            # Freezing the pre-trained weight matrix
-            self.conv.weight.requires_grad = False
-        self.reset_parameters()
-        self.merged = False
-
-    def reset_parameters(self):
-        self.conv.reset_parameters()
-        if hasattr(self, 'lora_A'):
-            # initialize A the same way as the default for nn.Linear and B to zero
-            nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-            nn.init.zeros_(self.lora_B)
-
-    def train(self, mode=True):
-        super(ConvLoRA, self).train(mode)
-        if mode:
-            if self.merge_weights and self.merged:
-                if self.r > 0:
-                    # Make sure that the weights are not merged
-                    self.conv.weight.data -= (self.lora_B @ self.lora_A).view(self.conv.weight.shape) * self.scaling
-                self.merged = False
-        else:
-            if self.merge_weights and not self.merged:
-                if self.r > 0:
-                    # Merge the weights and mark it
-                    self.conv.weight.data += (self.lora_B @ self.lora_A).view(self.conv.weight.shape) * self.scaling
-                self.merged = True
-
-    def forward(self, x):
-        if self.r > 0 and not self.merged:
-            return self.conv._conv_forward(
-                x, 
-                self.conv.weight + (self.lora_B @ self.lora_A).view(self.conv.weight.shape) * self.scaling,
-                self.conv.bias
-            )
-        return self.conv(x)
-
-class Conv2d(ConvLoRA):
-    def __init__(self, *args, **kwargs):
-        super(Conv2d, self).__init__(nn.Conv2d, *args, **kwargs)
-
-class Conv1d(ConvLoRA):
-    def __init__(self, *args, **kwargs):
-        super(Conv1d, self).__init__(nn.Conv1d, *args, **kwargs)
-
-# Can Extend to other ones like this
-
-class Conv3d(ConvLoRA):
-    def __init__(self, *args, **kwargs):
-        super(Conv3d, self).__init__(nn.Conv3d, *args, **kwargs)

@@ -10,10 +10,26 @@ from typing import Dict
 from .layers import LoRALayer
 
 
-def mark_only_lora_as_trainable(model: nn.Module, bias: str = 'none') -> None:
-    for n, p in model.named_parameters():
-        if 'lora_' not in n:
-            p.requires_grad = False
+def mark_only_lora_as_trainable(model: nn.Module, lora_type, bias: str = 'none') -> None:
+    if lora_type in ['lora','dictlora','dictlora4lanfusion','dictlora4ecam','dictlora4pcam']:
+        for n, p in model.named_parameters():
+            if 'lora_' not in n:
+                p.requires_grad = False
+    elif lora_type == "dictlora4velora":
+        for n, p in model.named_parameters():
+            if 'lora_A_kid' not in n and 'lora_B_kid' not in n:
+                p.requires_grad = False
+    elif lora_type == "dictlora4mole":
+        for n, p in model.named_parameters():
+            if 'lora_router' not in n:
+                p.requires_grad = False
+    elif lora_type == "vera":
+        for n, p in model.named_parameters():
+            if 'vera_lambda' not in n:
+                p.requires_grad = False
+    else:
+        raise NotImplementedError
+
     if bias == 'none':
         return
     elif bias == 'all':
